@@ -1,0 +1,12 @@
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+matplotlib>=3.7
+seaborn>=0.12
+jupyter>=1.0
+notebook>=7.0
+ipykernel>=6.0
+tqdm>=4.65
+arch>=6.2
+pandas_market_calendars>=4.3
+pyarrow>=12.0
