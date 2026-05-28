@@ -3,18 +3,29 @@ price_process.py
 ----------------
 Mid-price and bid-ask spread dynamics for all N bonds.
 
-Four layers stacked on top of each other:
-  1. Common factor VAR(1)        — drives correlated moves across bonds
-  2. GARCH(1,1) idio variance    — vol clustering
+Four layers:
+  1. Common factor VAR(1)         — correlated moves across all bonds
+  2. GARCH(1,1) idio variance     — vol clustering, correctly implemented
   3. Cross-bond spillover η·Σ·ε  — similar bonds partially share idio shocks
-  4. MMPP micro-price drift      — imbalance between buy/sell flow drifts mid
+  4. MMPP micro-price drift       — buy/sell flow imbalance tilts the mid
 
-Spread δ⁰_{n,t} widens with vol, inventory pressure, and illiquidity tier.
-The normalised quote δ/δ⁰ is what enters the logistic demand curve.
+The previous version had two bugs that together suppressed all diffusive
+structure and made prices look piecewise-linear:
 
-All updates are discrete-time steps of size dt (in seconds).
-For the simulation's short timesteps (seconds to minutes) the discretisation
-error is negligible.
+  Bug 1 — GARCH used h_t as a proxy for ε_t² in the α term.
+           Real GARCH: h_{t+1} = ω + α·ε_t² + β·h_t
+           Bad GARCH:  h_{t+1} ≈ (ω + (α+β)·h_t)  ← always near its mean
+           With α=0.10 and β=0.84, the bad version gave h_{t+1} ≈ 0.94·h_t + 0.05,
+           which converges instantly to h*=0.83 and never moves.  There was
+           no vol clustering, no GARCH effect at all.
+
+  Bug 2 — Factor contribution was multiplied by dt_days a second time.
+           self.factors already evolves on a per-step basis; applying dt_days
+           again made the factor term negligible and broke the intended
+           correlation structure across bonds.
+
+Both are fixed here.  The key GARCH change: we save the realised idio
+shock ε_t each step and use ε_t² in the next step's variance update.
 """
 
 from __future__ import annotations
@@ -23,12 +34,14 @@ from typing import Dict
 from rfq_sim.core.config import BondConfig
 from rfq_sim.core.bonds import BondUniverse
 
-_DAY_S = 36_000.0   # Seconds per trading day
+# One trading day = 10 hours = 36,000 seconds
+_DAY_S = 36_000.0
 
 
 class PriceProcess:
     """
-    Mutable price state for all N bonds.  Updated by the simulator's main loop.
+    Mutable price state for all N bonds.  Called by the simulator's main
+    loop on every clock advance.
     """
 
     def __init__(
@@ -42,115 +55,153 @@ class PriceProcess:
         self.rng   = rng
         self.N     = len(bonds)
 
-        # Current mid prices — evolve throughout the simulation
+        # ── State variables ────────────────────────────────────────────
+
+        # Mid prices, initialised from bond.price0
         self.mid_prices = np.array(
             [b.price0 for b in bonds.bonds], dtype=np.float64
         )
 
-        # GARCH conditional variance h_t for each bond (initialised to σ²)
+        # GARCH conditional variance h_t² per bond.
+        # Initialised at the unconditional variance σ_n².
         self.garch_h = np.array(
             [b.sigma ** 2 for b in bonds.bonds], dtype=np.float64
         )
 
-        # Common factor state (p=3 factors, VAR(1))
-        self.factors = self.rng.normal(0.0, 0.10, size=cfg.n_common_factors)
+        # Last realised idio shock ε_{t-1} per bond — needed for GARCH update.
+        # Initialised at zero (treated as one quiet step before burn-in).
+        self._last_idio = np.zeros(self.N, dtype=np.float64)
 
-        # Current bid-ask spreads (initialised to baseline, then dynamic)
+        # Common factor state (p=3): rates, HY-spread, sector.
+        # Initialised near zero; burns in quickly via the VAR dynamics.
+        self.factors = self.rng.normal(0.0, 0.05, size=cfg.n_common_factors)
+
+        # Current bid-ask spreads, initialised to each bond's baseline
         self.spreads = np.array(
             [b.baseline_spread for b in bonds.bonds], dtype=np.float64
         )
 
-        # Pre-cache factor loading matrix B ∈ ℝ^{N×p}
+        # ── Cached matrices (computed once) ───────────────────────────
+
+        # Factor loading matrix B ∈ ℝ^{N×p}: B[n] = bond n's β_factor vector
         self._B = np.stack(
             [b.beta_factor for b in bonds.bonds], axis=0
-        )  # (N, p)
+        ).astype(np.float64)   # shape (N, p)
 
-        # Pre-cache kappa vector
+        # MMPP drift sensitivity κ_n per bond
         self._kappa = np.array(
             [b.kappa for b in bonds.bonds], dtype=np.float64
-        )
+        )   # shape (N,)
+
+    # ------------------------------------------------------------------
+    # Main price step
+    # ------------------------------------------------------------------
 
     def step(
         self,
-        dt_s:            float,                    # Time step in seconds
-        mmpp_imbalances: Dict[str, float],         # sector → λ_ask − λ_bid (day⁻¹)
-        inventory:       np.ndarray,               # Current inventory per bond
-        h_t:             float,                    # Intraday calendar multiplier
+        dt_s:             float,                  # Time elapsed in seconds
+        mmpp_imbalances:  Dict[str, float],        # sector → λ_ask − λ_bid (day⁻¹)
+        inventory:        np.ndarray,              # Current inventory per bond (N,)
+        h_t:              float,                   # Intraday calendar multiplier
     ):
         """
-        Advance all prices by dt_s seconds.
+        Advance all N bond prices by dt_s seconds.
 
-        Δ S_n = β_n · ΔF  +  η · Σ · ε  +  κ_n · imbalance · dt  +  jump
-        h_t^2 is updated via GARCH(1,1).
-        δ⁰_n is updated from the new h_t, inventory, and tier.
+        ΔS_n = β_n·ΔF·√dt  +  ε_n  +  η·Σ·ε  −  κ_n·imbalance·dt  +  jump
+
+        where ε_n ~ N(0, √(h_t²·dt)) is drawn fresh each step, and h_t² is
+        updated via proper GARCH(1,1) using the previous step's ε².
         """
         dt_days = dt_s / _DAY_S
 
-        # 1. Common factor VAR(1) step
-        #    ΔF_t = (ρ−1)·F_{t−1}·dt + σ_F·√dt·ε_F
-        self.factors = (
-            self.cfg.factor_ar_coeff * self.factors
-            + self.cfg.factor_daily_vol * np.sqrt(dt_days)
+        # ── 1. Common factor VAR(1) step ──────────────────────────────
+        # F_t = ρ·F_{t-1} + σ_F·√dt·z,   z ~ N(0, I)
+        # The √dt scaling is correct: over one full day dt=1, the factor
+        # shock has std = factor_daily_vol, consistent with daily vol units.
+        factor_shock = (
+            self.cfg.factor_daily_vol
+            * np.sqrt(dt_days)
             * self.rng.standard_normal(self.cfg.n_common_factors)
         )
+        self.factors = self.cfg.factor_ar_coeff * self.factors + factor_shock
 
-        # 2. GARCH(1,1) variance update
-        #    h² ← ω + α·h²(proxy for ε²) + β·h²
-        self.garch_h = np.clip(
+        # ── 2. Factor contribution to price ───────────────────────────
+        # ΔS_n^{factor} = B_n · ΔF
+        # B_n is the bond's loading on each factor.  We do NOT multiply by
+        # dt_days again — the √dt is already in factor_shock above.
+        factor_contrib = self._B @ factor_shock   # shape (N,)
+
+        # ── 3. GARCH(1,1) variance update ─────────────────────────────
+        # h_{t}² = ω + α·ε_{t-1}² + β·h_{t-1}²
+        # This is the correct GARCH recursion.  _last_idio holds ε_{t-1}.
+        self.garch_h = (
             self.cfg.garch_omega
-            + (self.cfg.garch_alpha + self.cfg.garch_beta) * self.garch_h,
-            1e-6, 5.0,
+            + self.cfg.garch_alpha * self._last_idio ** 2
+            + self.cfg.garch_beta  * self.garch_h
         )
+        # Clip to a sensible range to prevent numerical blow-up
+        self.garch_h = np.clip(self.garch_h, 1e-6, 25.0)
 
-        # 3. Idio shocks scaled by current GARCH vol and √dt
-        idio_std    = np.sqrt(self.garch_h * dt_days)
+        # ── 4. Idiosyncratic shocks ε_n ~ N(0, σ_{GARCH}·√dt) ────────
+        # GARCH vol is in daily units, so we scale by √dt_days.
+        idio_std    = np.sqrt(self.garch_h * dt_days)   # shape (N,)
         idio_shocks = self.rng.standard_normal(self.N) * idio_std
 
-        # 4. Cross-bond spillover: η · Σ · ε
+        # Save for the next step's GARCH update
+        self._last_idio = idio_shocks.copy()
+
+        # ── 5. Cross-bond spillover η·Σ·ε ─────────────────────────────
+        # Similar bonds partially share each other's idiosyncratic shocks.
+        # Σ is the observable similarity matrix (symmetric, diag=1).
         spillover = (
             self.cfg.price_spillover_eta
             * (self.bonds.similarity_matrix @ idio_shocks)
         )
 
-        # 5. MMPP micro-price drift: κ_n · (λ_ask − λ_bid) · dt
-        #    Sell pressure (positive imbalance) → price drifts downward
-        imb_by_bond = np.array([
+        # ── 6. MMPP micro-price drift ──────────────────────────────────
+        # dS_n = −κ_n·(λ_ask − λ_bid)·dt
+        # Sell pressure (λ_ask > λ_bid, positive imbalance) → price drifts down.
+        imb_per_bond = np.array([
             mmpp_imbalances.get(b.sector, 0.0) for b in self.bonds.bonds
         ])
-        drift = -self._kappa * imb_by_bond * dt_days
+        drift = -self._kappa * imb_per_bond * dt_days   # shape (N,)
 
-        # 6. Common-factor contribution: B · ΔF · dt_days
-        factor_contrib = (self._B @ self.factors) * dt_days
+        # ── 7. Total price move ────────────────────────────────────────
+        self.mid_prices += factor_contrib + idio_shocks + spillover + drift
 
-        # 7. Aggregate price move
-        self.mid_prices += idio_shocks + spillover + drift + factor_contrib
-
-        # 8. Sector-level jump process (double-exponential / Laplace jumps)
+        # ── 8. Sector-level jump process ──────────────────────────────
+        # Rare Laplace-distributed jumps, correlated within sectors.
+        # Probability of a jump in this sector during this step = λ_jump·dt.
         for sector in self.cfg.sectors:
-            p_jump = self.cfg.jump_intensity_per_day * dt_days
-            if self.rng.random() < p_jump:
+            if self.rng.random() < self.cfg.jump_intensity_per_day * dt_days:
                 mag = float(self.rng.laplace(0.0, self.cfg.jump_scale))
                 for i, b in enumerate(self.bonds.bonds):
                     if b.sector == sector:
-                        # All bonds in the sector get the same directional jump
-                        # but scaled by a small uniform factor for heterogeneity
+                        # Each bond in the sector gets the jump, scaled by a
+                        # small uniform factor to add cross-sectional heterogeneity
                         self.mid_prices[i] += mag * (0.5 + 0.5 * self.rng.random())
 
-        # 9. Update bid-ask spreads
+        # ── 9. Update bid-ask spreads ──────────────────────────────────
         self._update_spreads(inventory, h_t)
+
+    # ------------------------------------------------------------------
+    # Spread dynamics
+    # ------------------------------------------------------------------
 
     def _update_spreads(self, inventory: np.ndarray, h_t: float):
         """
-        δ⁰_{n,t} = δ̄_n · (1 + φ_σ·σ_{n,t} + φ_I·|I_n| + φ_tier·(tier-1))
+        δ⁰_{n,t} = δ̄_n · (1 + φ_σ·√h_t² + φ_I·|I_n| + φ_tier·(tier-1))
 
-        Spread widens with current vol, inventory exposure, and illiquidity.
-        The 1/h_t term makes spreads slightly wider during thin hours.
+        Spread widens with current realised vol, inventory pressure, and
+        illiquidity tier.  The 1/h_t time-of-day term makes spreads
+        slightly wider during thin early-morning and late-afternoon hours.
         """
         cfg = self.cfg
         for i, b in enumerate(self.bonds.bonds):
             vol_factor  = cfg.spread_phi_sigma * float(np.sqrt(self.garch_h[i]))
             inv_factor  = cfg.spread_phi_inv   * abs(float(inventory[i]))
             tier_factor = cfg.spread_phi_tier  * (b.liquidity_tier - 1)
+            # Thin hours → h_t small → 1/h_t large → wider spread
             time_factor = 0.10 / max(float(h_t), 0.05)
 
             self.spreads[i] = max(
@@ -170,5 +221,5 @@ class PriceProcess:
         return float(self.spreads[n])
 
     def vol(self, n: int) -> float:
-        """Current daily idio vol estimate √h_t."""
+        """Current annualised-daily vol estimate: √h_t for bond n."""
         return float(np.sqrt(self.garch_h[n]))
